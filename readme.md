@@ -1,0 +1,1 @@
+optical flow based on: https://stackoverflow.com/questions/14321092/lucas-kanade-python-numpy-implementation-uses-enormous-amount-of-memory
