@@ -10,10 +10,16 @@ from time import gmtime, strftime
 import numpy as np
 import tensorflow as tf
 import math
+import logging
+
+logger = logging.getLogger('general')
+
 def sampling(args):
     z_mean, z_log_var = args
-    batch = K.shape(z_mean)[0]
     dim = K.int_shape(z_mean)[1]
+
+    batch = K.shape(z_mean)[0]
+
     # by default, random_normal has mean=0 and std=1.0
     epsilon = K.random_normal(shape=(batch, dim))
     return z_mean + K.exp(0.5 * z_log_var) * epsilon
@@ -36,18 +42,17 @@ def calc_gamma(z_latent):
     z is the latent representation from the input x
 
     return the gamma with shape=(batch_size, n_feat)
+
     """
-    print(mu.get_shape())
-    print(batch_size)
-    print("end")
+    batch = batch_size
 
 
     z_3 = tf.transpose(K.repeat(z_latent, n_feat), [0, 2, 1])
     #mu_3 = tf.reshape(tf.tile(mu, batch_size), (batch_size, latent_size, n_feat))
-    mu_3 = K.repeat_elements(tf.expand_dims(mu, 0), batch_size, axis=0)
-    sigma_3 = K.repeat_elements(tf.expand_dims(sigma, 0), batch_size, axis=0)
+    mu_3 = K.repeat_elements(tf.expand_dims(mu, 0), batch, axis=0)
+    sigma_3 = K.repeat_elements(tf.expand_dims(sigma, 0), batch, axis=0)
     p_pi_3 = K.repeat_elements(tf.expand_dims(p_pi, 0), latent_size, axis=0)
-    p_pi_3 = K.repeat_elements(tf.expand_dims(p_pi_3, 0), batch_size, axis=0)
+    p_pi_3 = K.repeat_elements(tf.expand_dims(p_pi_3, 0), batch, axis=0)
 
     inner_part = K.log(p_pi_3) - 0.5 * K.log(2 * math.pi * sigma_3) - K.square(z_3 - mu_3) / (2 * sigma_3)
 
@@ -89,7 +94,9 @@ latent_size = 10
 n_feat = 10
 input_dim = 784
 batch_size = 128
+creating_model = True
 
+logger.info("defining layers")
 x = Input(shape=(input_dim,))
 h = Dense(layer_sizes[0], activation='relu')(x)
 h = Dense(layer_sizes[1], activation='relu')(h)
@@ -102,25 +109,42 @@ h_decoded = Dense(layer_sizes[-2], activation='relu')(h_decoded)
 h_decoded = Dense(layer_sizes[-3], activation='relu')(h_decoded)
 x_decoded_mean = Dense(input_dim, activation='sigmoid')(h_decoded)
 
+logger.info("loading gmm init values")
 p_pi, mu, sigma = get_gmm_var_start(latent_size, n_feat)
 
+logger.info("defining Gamma layer")
 Gamma = Lambda(calc_gamma, output_shape=(n_feat,))(z)
+logger.info("creating sample output and gamma output")
 sample_output = Model(x, z_mean)
 gamma_output = Model(x,Gamma)
 
+logger.info("creating GMM model")
 GMM_model = Model(x, x_decoded_mean)
 
-lr_nn = 0.002
-lr_gmm = 0.002
-adam_nn= Adam(lr=lr_nn, epsilon=1e-4)
-adam_gmm= Adam(lr=lr_gmm, epsilon=1e-4)
-
+lr_nn = 0.0025
+lr_gmm = 0.0025
+adam_nn = Adam(lr=lr_nn, epsilon=1e-4)
+adam_gmm = Adam(lr=lr_gmm, epsilon=1e-4)
+print("compiling")
 GMM_model.compile(optimizer=adam_nn, loss=vae_loss,add_trainable_weights=[p_pi, mu, sigma],add_optimizer=adam_gmm)
+print("loading values")
+amount_batches = 59999 // batch_size
+train_values, train_labels, test_values, test_labels = get_small_test_batch(amount_batches * batch_size)
+print("fitting")
 
-train_values, train_labels, test_values, test_labels = get_small_test_batch(512)
+epoch_amount = 50
+update_lv = 10
+decay_nn = 0.9
+decay_gmm = 0.9
+for i in range(epoch_amount):
+    print("currently on epoch: ", i)
+    np.random.shuffle(train_values)
+    batches = np.split(train_values, amount_batches)
+    # if i % update_lv == 0:
+    #     adam_nn.lr.set_value(max(adam_nn.lr.get_value() * decay_nn, 0.0002))
+    #     adam_gmm.lr.set_value(max(adam_gmm.lr.get_value() * decay_gmm, 0.0002))
+    for b_index, batch in enumerate(batches):
+        loss = GMM_model.train_on_batch(batch, batch)
+        print("epoch: ", i, ", batch: ", b_index, " / ", amount_batches, " ==> loss: ", loss)
 
-GMM_model.fit(train_values, train_values,
-        shuffle=True,
-        epochs=50,
-        batch_size=batch_size,
-        validation_data=(test_values, test_values))
+GMM_model.save("GMM_26_11_12.h5")
