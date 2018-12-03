@@ -1,150 +1,252 @@
-from keras.layers import Lambda, Input, Dense, Conv2D, Flatten
-from keras.models import Model
-from keras.datasets import mnist
-from keras.optimizers import Adam
-from keras.losses import mse, binary_crossentropy
-from keras.utils import plot_model
-from keras import backend as K
-from get_mnist import get_number_mnist, get_small_test_batch
-from time import gmtime, strftime
 import numpy as np
 import tensorflow as tf
+from tensorflow.contrib.slim import fully_connected as fc
+import matplotlib
 import math
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+plt.ioff()
 import logging
 
-logger = logging.getLogger('general')
+logger = logging.getLogger('GMMM_VAE')
 
-def sampling(args):
-    z_mean, z_log_var = args
-    dim = K.int_shape(z_mean)[1]
+# from get_mnist import get_number_mnist, get_small_test_batch
+#
+# train_values, train_labels, test_values, test_labels = get_small_test_batch(10)
+# input_dim = 784
 
-    batch = K.shape(z_mean)[0]
+from tensorflow.examples.tutorials.mnist import input_data
+mnist = input_data.read_data_sets('MNIST_data', one_hot=True)
+num_sample = mnist.train.num_examples
+input_dim = mnist.train.images[0].shape[0]
+w = h = 28
 
-    # by default, random_normal has mean=0 and std=1.0
-    epsilon = K.random_normal(shape=(batch, dim))
-    return z_mean + K.exp(0.5 * z_log_var) * epsilon
+class VariantionalAutoencoder(object):
 
-def get_gmm_var_start(latent_dim, n_feat):
-    # start with evenly distributed change for every Cat
-    p_pi = K.variable(K.np.ones(n_feat) / n_feat)
-    # values from gaussian
-    mu = K.zeros(shape=(latent_dim, n_feat))
-    sigma = K.ones(shape=(latent_dim, n_feat))
+    def __init__(self, learning_rate=1e-3, batch_size=100, latent_size=10, gmm_n_feat=10):
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+        self.latent_size = latent_size
+        self.gmm_pi = tf.Variable(tf.ones(gmm_n_feat) / gmm_n_feat, trainable=True, dtype=tf.float32)
+        self.gmm_mu = tf.Variable(tf.zeros(gmm_n_feat), trainable=True, dtype=tf.float32)
+        self.gmm_sigma = tf.Variable(tf.ones(gmm_n_feat), trainable=True, dtype=tf.float32)
+        self.gmm_n_feat = gmm_n_feat
+        print('start build')
+        self.build()
 
-    return p_pi, mu, sigma
+        self.sess = tf.InteractiveSession()
+        self.sess.run(tf.global_variables_initializer())
 
-# (15) and (16) in paper
-def calc_gamma(z_latent):
-    """
-    First we should transform everything to shape=(batch_size, latent_dim, n_feat)
-    then we use the eq (15) and (16) from the paper
+        amount = len(tf.trainable_variables())
+        print("amount of trainable vars: " + str(amount))
 
-    z is the latent representation from the input x
+    # Build the network and the loss functions
+    def build(self):
+        self.debug_dict = {}
+        self.debug_dict['gmm_pi'] = self.gmm_pi
+        self.debug_dict['gmm_mu'] = self.gmm_mu
+        self.debug_dict['gmm_sigma'] = self.gmm_sigma
 
-    return the gamma with shape=(batch_size, n_feat)
+        self.x = tf.placeholder(name='x', dtype=tf.float32, shape=[self.batch_size, input_dim])
 
-    """
-    batch = batch_size
+        # Encode
+        # x -> z_mean, z_sigma -> z
+        f1 = fc(self.x, 512, scope='enc_fc1', activation_fn=tf.nn.relu)
+        f2 = fc(f1, 384, scope='enc_fc2', activation_fn=tf.nn.relu)
+        f3 = fc(f2, 256, scope='enc_fc3', activation_fn=tf.nn.relu)
+
+        self.z_mu = fc(f3, self.latent_size, scope='enc_fc4_mu', activation_fn=None)
+        self.z_log_sigma_sq = fc(f3, self.latent_size, scope='enc_fc4_sigma', activation_fn=None)
+        eps = tf.random_normal(shape=tf.shape(self.z_log_sigma_sq),
+                               mean=0, stddev=1, dtype=tf.float32)
+
+        self.z = self.z_mu + tf.sqrt(tf.exp(self.z_log_sigma_sq)) * eps
+
+        # Decode
+        # z -> x_hat
+        g1 = fc(self.z, 256, scope='dec_fc1', activation_fn=tf.nn.relu)
+        g2 = fc(g1, 384, scope='dec_fc2', activation_fn=tf.nn.relu)
+        g3 = fc(g2, 512, scope='dec_fc3', activation_fn=tf.nn.relu)
+        self.x_hat = fc(g3, input_dim, scope='dec_fc4', activation_fn=tf.sigmoid)
+
+        # Loss
+        # Reconstruction loss, cross entropy
+        epsilon = 1e-10
+        recon_loss = -tf.reduce_sum(
+            self.x * tf.log(epsilon+self.x_hat) + (1-self.x) * tf.log(epsilon+1-self.x_hat),
+            axis=1
+        )
+        recon_loss = tf.reduce_mean(recon_loss)
+
+        # change to shape (batch_dim, latent_dim, n_feat)
+        gmm_mu_3 = tf.ones([self.batch_size, self.latent_size, self.gmm_n_feat]) * self.gmm_mu
+        gmm_pi_3 = tf.ones([self.batch_size, self.latent_size, self.gmm_n_feat]) * self.gmm_pi
+        gmm_pi_2 = tf.ones([self.batch_size, self.gmm_n_feat]) * self.gmm_pi
+        gmm_sigma_3 = tf.ones([self.batch_size, self.latent_size, self.gmm_n_feat]) * self.gmm_sigma
+
+        # Now make sure the network output are also that shape
+        z_3 = tf.tile(tf.expand_dims(self.z, -1), [1, 1, self.gmm_n_feat])
+        mu_3 = tf.tile(tf.expand_dims(self.z_mu, -1), [1, 1, self.gmm_n_feat])
+        var_3 = tf.tile(tf.expand_dims(self.z_log_sigma_sq, -1), [1, 1, self.gmm_n_feat])
+
+        # shape = (batch, n_feat)
+        p_c_z = tf.exp(tf.reduce_sum(tf.log(gmm_pi_3) - 0.5 * tf.log(2 * math.pi * gmm_sigma_3) - tf.square(z_3 - gmm_mu_3)/ (2 * gmm_sigma_3), 1)) + 1e-10
+        # same shape because broadcasting
+        gamma = p_c_z / tf.reduce_sum(p_c_z, -1, keepdims=True)
+
+        gamma_3 = tf.tile(tf.expand_dims(gamma, 1), [1, self.latent_size, 1])
 
 
-    z_3 = tf.transpose(K.repeat(z_latent, n_feat), [0, 2, 1])
-    #mu_3 = tf.reshape(tf.tile(mu, batch_size), (batch_size, latent_size, n_feat))
-    mu_3 = K.repeat_elements(tf.expand_dims(mu, 0), batch, axis=0)
-    sigma_3 = K.repeat_elements(tf.expand_dims(sigma, 0), batch, axis=0)
-    p_pi_3 = K.repeat_elements(tf.expand_dims(p_pi, 0), latent_size, axis=0)
-    p_pi_3 = K.repeat_elements(tf.expand_dims(p_pi_3, 0), batch, axis=0)
+        # these should all be shape=(batch_dim)
+        loss1 = tf.reduce_sum(0.5 * gamma_3 * (self.latent_size * tf.log(math.pi * 2) + tf.log(gmm_sigma_3) + tf.exp(var_3) / gmm_sigma_3 + tf.square(mu_3 - gmm_mu_3) / gmm_sigma_3), [1, 2])
+        loss2 = -0.5 * tf.reduce_sum(self.z_log_sigma_sq + 1, -1)
+        loss3 = -1 * tf.reduce_sum(tf.log(gmm_pi_2) * gamma, -1)
+        loss4 = tf.reduce_sum(tf.log(gamma) * gamma, -1)
 
-    inner_part = K.log(p_pi_3) - 0.5 * K.log(2 * math.pi * sigma_3) - K.square(z_3 - mu_3) / (2 * sigma_3)
+        # create the gmm loss with shape = (batch) and then the gmm_loss as just a value (reduce_mean)
 
-    temp_p_c_z = K.exp(K.sum(inner_part, axis=1)) + 1e-10
+        gmm_loss = tf.reduce_mean(loss1 + loss2 + loss3 + loss4)
 
-    return temp_p_c_z / K.sum(temp_p_c_z, axis=-1, keepdims=True)
+        self.total_loss = recon_loss + gmm_loss
+        self.debug_dict['recon_loss'] = recon_loss
+        self.debug_dict['gmm_loss'] = gmm_loss
+        self.train_op = tf.train.AdamOptimizer(
+            learning_rate=self.learning_rate).minimize(self.total_loss)
+        return
 
-def vae_loss(x, x_decoded):
-    z_3 = tf.transpose(K.repeat(z, n_feat), [0, 2, 1])
+    # Execute the forward and the backward pass
+    def run_single_step(self, single_batch):
+        _, debug_dict = self.sess.run(
+            [self.train_op, self.debug_dict],
+            feed_dict={self.x: single_batch}
+        )
+        return debug_dict
 
-    mu_3 = K.repeat_elements(tf.expand_dims(mu, 0), batch_size, axis=0)
-    sigma_3 = K.repeat_elements(tf.expand_dims(sigma, 0), batch_size, axis=0)
-    p_pi_3 = K.repeat_elements(tf.expand_dims(p_pi, 0), latent_size, axis=0)
-    p_pi_3 = K.repeat_elements(tf.expand_dims(p_pi_3, 0), batch_size, axis=0)
+    # x -> x_hat
+    def reconstructor(self, x):
+        x_hat = self.sess.run(self.x_hat, feed_dict={self.x: x})
+        return x_hat
 
-    inner_part = K.log(p_pi_3) - 0.5 * K.log(2 * math.pi * sigma_3) - K.square(z_3 - mu_3) / (2 * sigma_3)
+    # z -> x
+    def generator(self, z):
+        x_hat = self.sess.run(self.x_hat, feed_dict={self.z: z})
+        return x_hat
 
-    temp_p_c_z = K.exp(K.sum(inner_part, axis=1)) + 1e-10
-    gamma = temp_p_c_z / K.sum(temp_p_c_z, axis=-1, keepdims=True)
+    # x -> z
+    def transformer(self, x):
+        z = self.sess.run(self.z, feed_dict={self.x: x})
+        return z
 
-    gamma_t = K.repeat(gamma, latent_size)
 
-    z_mean_t = tf.transpose(K.repeat(z_mean, n_feat), [0, 2, 1])
-    z_log_var_t = tf.transpose(K.repeat(z_log_var, n_feat), [0, 2, 1])
+def trainer(learning_rate=2e-3, batch_size=100, num_epoch=75, latent_size=10):
+    model = VariantionalAutoencoder(learning_rate=learning_rate,
+                                    batch_size=batch_size, latent_size=latent_size, gmm_n_feat=10)
 
-    dec_error = 0.9 * input_dim * binary_crossentropy(x, x_decoded)
+    # batches = np.split(train_values, 5)
+    # for i in range(5):
+    #     debug_dict = model.run_single_step(batches[i])
+    #     print("============================= test {} =============================".format(i))
+    #     for k, v in debug_dict.items():
+    #         print(k)
+    #         print(v)
 
-    dec_error += K.sum(0.5*gamma_t*(latent_size*K.log(math.pi*2)+K.log(sigma_3)+K.exp(z_log_var_t)/sigma_3+K.square(z_mean_t-mu_3)/sigma_3), axis=(1, 2))
-    dec_error -= 0.5*K.sum(z_log_var+1, axis=-1)
-    change = K.repeat_elements(tf.expand_dims(p_pi, 0), batch_size, 0)
-    dec_error -= K.sum(K.log(change)*gamma, axis=-1)
-    dec_error += K.sum(K.log(gamma)*gamma, axis=-1)
 
-    return dec_error
+    for epoch in range(num_epoch):
+        for iter in range(num_sample // batch_size):
+            # Obtina a batch
+            batch = mnist.train.next_batch(batch_size)
+            # Execute the forward and the backward pass and report computed losses
+            debug_dict = model.run_single_step(batch[0])
 
-# layer def
-layer_sizes = [256, 256, 512]
-latent_size = 10
-n_feat = 10
-input_dim = 784
-batch_size = 128
-creating_model = True
+        if epoch % 5 == 0:
+            print("======={}=======".format(epoch))
+            for k, v in debug_dict.items():
+                print(k)
+                print(v)
 
-logger.info("defining layers")
-x = Input(shape=(input_dim,))
-h = Dense(layer_sizes[0], activation='relu')(x)
-h = Dense(layer_sizes[1], activation='relu')(h)
-h = Dense(layer_sizes[2], activation='relu')(h)
-z_mean = Dense(latent_size)(h)
-z_log_var = Dense(latent_size)(h)
-z = Lambda(sampling, output_shape=(latent_size,))([z_mean, z_log_var])
-h_decoded = Dense(layer_sizes[-1], activation='relu')(z)
-h_decoded = Dense(layer_sizes[-2], activation='relu')(h_decoded)
-h_decoded = Dense(layer_sizes[-3], activation='relu')(h_decoded)
-x_decoded_mean = Dense(input_dim, activation='sigmoid')(h_decoded)
+    print('Done!')
+    return model
 
-logger.info("loading gmm init values")
-p_pi, mu, sigma = get_gmm_var_start(latent_size, n_feat)
+print("start training")
+# Train the model
+model = trainer(learning_rate=1e-4,  batch_size=15, num_epoch=100, latent_size=10)
 
-logger.info("defining Gamma layer")
-Gamma = Lambda(calc_gamma, output_shape=(n_feat,))(z)
-logger.info("creating sample output and gamma output")
-sample_output = Model(x, z_mean)
-gamma_output = Model(x,Gamma)
+print("ended training")
 
-logger.info("creating GMM model")
-GMM_model = Model(x, x_decoded_mean)
 
-lr_nn = 0.0025
-lr_gmm = 0.0025
-adam_nn = Adam(lr=lr_nn, epsilon=1e-4)
-adam_gmm = Adam(lr=lr_gmm, epsilon=1e-4)
-print("compiling")
-GMM_model.compile(optimizer=adam_nn, loss=vae_loss,add_trainable_weights=[p_pi, mu, sigma],add_optimizer=adam_gmm)
-print("loading values")
-amount_batches = 59999 // batch_size
-train_values, train_labels, test_values, test_labels = get_small_test_batch(amount_batches * batch_size)
-print("fitting")
 
-epoch_amount = 50
-update_lv = 10
-decay_nn = 0.9
-decay_gmm = 0.9
-for i in range(epoch_amount):
-    print("currently on epoch: ", i)
-    np.random.shuffle(train_values)
-    batches = np.split(train_values, amount_batches)
-    # if i % update_lv == 0:
-    #     adam_nn.lr.set_value(max(adam_nn.lr.get_value() * decay_nn, 0.0002))
-    #     adam_gmm.lr.set_value(max(adam_gmm.lr.get_value() * decay_gmm, 0.0002))
-    for b_index, batch in enumerate(batches):
-        loss = GMM_model.train_on_batch(batch, batch)
-        print("epoch: ", i, ", batch: ", b_index, " / ", amount_batches, " ==> loss: ", loss)
 
-GMM_model.save("GMM_26_11_12.h5")
+
+
+
+
+
+
+
+
+# Test the trained model: reconstruction
+batch = mnist.test.next_batch(100)
+x_reconstructed = model.reconstructor(batch[0])
+
+n = np.sqrt(model.batch_size).astype(np.int32)
+I_reconstructed = np.empty((h*n, 2*w*n))
+for i in range(n):
+    for j in range(n):
+        x = np.concatenate(
+            (x_reconstructed[i*n+j, :].reshape(h, w),
+             batch[0][i*n+j, :].reshape(h, w)),
+            axis=1
+        )
+        I_reconstructed[i*h:(i+1)*h, j*2*w:(j+1)*2*w] = x
+
+fig = plt.figure()
+plt.imshow(I_reconstructed, cmap='gray')
+plt.savefig('I_reconstructed.png')
+plt.close(fig)
+
+# Test the trained model: generation
+# Sample noise vectors from N(0, 1)
+z = np.random.normal(size=[model.batch_size, model.latent_size])
+x_generated = model.generator(z)
+
+n = np.sqrt(model.batch_size).astype(np.int32)
+I_generated = np.empty((h*n, w*n))
+for i in range(n):
+    for j in range(n):
+        I_generated[i*h:(i+1)*h, j*w:(j+1)*w] = x_generated[i*n+j, :].reshape(28, 28)
+
+fig = plt.figure()
+plt.imshow(I_generated, cmap='gray')
+plt.savefig('I_generated.png')
+plt.close(fig)
+
+tf.reset_default_graph()
+# Train the model with 2d latent space
+model_2d = trainer(learning_rate=1e-4,  batch_size=100, num_epoch=50, latent_size=2)
+
+# Test the trained model: transformation
+batch = mnist.test.next_batch(3000)
+z = model_2d.transformer(batch[0])
+fig = plt.figure()
+plt.scatter(z[:, 0], z[:, 1], c=np.argmax(batch[1], 1))
+plt.colorbar()
+plt.grid()
+plt.savefig('I_transformed.png')
+plt.close(fig)
+
+# Test the trained model: transformation
+n = 20
+x = np.linspace(-2, 2, n)
+y = np.linspace(-2, 2, n)
+
+I_latent = np.empty((h*n, w*n))
+for i, yi in enumerate(x):
+    for j, xi in enumerate(y):
+        z = np.array([[xi, yi]]*model_2d.batch_size)
+        x_hat = model_2d.generator(z)
+        I_latent[(n-i-1)*28:(n-i)*28, j*28:(j+1)*28] = x_hat[0].reshape(28, 28)
+
+fig = plt.figure()
+plt.imshow(I_latent, cmap="gray")
+plt.savefig('I_latent.png')
+plt.close(fig)

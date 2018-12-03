@@ -22,7 +22,7 @@ autoencoder.compile(optimizer='adadelta', loss='binary_crossentropy')
 
 autoencoder.fit(train_values, train_values,
                 epochs=30,
-                batch_size=256,
+                batch_size=128,
                 shuffle=True,
                 validation_data=(test_values, test_values))
 

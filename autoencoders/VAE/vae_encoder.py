@@ -78,16 +78,15 @@ decoder_model = Model(dec_input, dec_output_layer)
 # compile and train
 vae_model.compile(optimizer='rmsprop', loss=vae_loss)
 
-
+print("loading values")
 train_values, train_labels, test_values, test_labels = get_number_mnist()
 
 vae_model.fit(train_values, train_values,
         shuffle=True,
-        epochs=50,
+        epochs=100,
         batch_size=128,
         validation_data=(test_values, test_values))
 
-vae_model.save('VAE' + strftime("%Y_%m_%d_%H_%M_%S", gmtime()) + '.h5')
-encoder_model.save('encoder' + strftime("%Y_%m_%d_%H_%M_%S", gmtime()) + '.h5')
-decoder_model.save('decoder' + strftime("%Y_%m_%d_%H_%M_%S", gmtime()) + '.h5')
+vae_model.save_weights('VAE' + strftime("%Y_%m_%d_%H_%M_%S", gmtime()) + '.h5')
+
 
