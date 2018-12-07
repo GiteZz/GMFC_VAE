@@ -7,6 +7,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 plt.ioff()
 import logging
+from time import strftime, gmtime
+import random
 
 logger = logging.getLogger('GMMM_VAE')
 
@@ -24,13 +26,23 @@ w = h = 28
 class VariantionalAutoencoder(object):
 
     def __init__(self, learning_rate=1e-3, batch_size=100, latent_size=10, gmm_n_feat=10):
-        self.learning_rate = learning_rate
+
         self.batch_size = batch_size
         self.latent_size = latent_size
-        self.gmm_pi = tf.Variable(tf.ones(gmm_n_feat) / gmm_n_feat, trainable=True, dtype=tf.float32)
-        self.gmm_mu = tf.Variable(tf.zeros(gmm_n_feat), trainable=True, dtype=tf.float32)
-        self.gmm_sigma = tf.Variable(tf.ones(gmm_n_feat), trainable=True, dtype=tf.float32)
         self.gmm_n_feat = gmm_n_feat
+        self.gmm_pi = tf.Variable(tf.ones([self.gmm_n_feat]) / gmm_n_feat, trainable=False, dtype=tf.float32)
+        print(self.gmm_pi)
+
+        #rand_mu = (np.random.randn(self.latent_size, self.gmm_n_feat) * 0.25 + 1) * [[-1,1][random.randrange(2)] for ]
+
+        self.gmm_mu = tf.Variable(tf.random.normal([self.gmm_n_feat]), trainable=True, dtype=tf.float32)
+        print(self.gmm_mu)
+
+        rand_sig = np.abs(np.random.randn(self.gmm_n_feat)) * 0.25 + 1
+
+        self.gmm_sigma = tf.Variable(rand_sig, trainable=True, dtype=tf.float32)
+        self.learning_rate = learning_rate
+
         print('start build')
         self.build()
 
@@ -38,6 +50,8 @@ class VariantionalAutoencoder(object):
         self.sess.run(tf.global_variables_initializer())
 
         amount = len(tf.trainable_variables())
+
+
         print("amount of trainable vars: " + str(amount))
 
     # Build the network and the loss functions
@@ -51,9 +65,9 @@ class VariantionalAutoencoder(object):
 
         # Encode
         # x -> z_mean, z_sigma -> z
-        f1 = fc(self.x, 512, scope='enc_fc1', activation_fn=tf.nn.relu)
-        f2 = fc(f1, 384, scope='enc_fc2', activation_fn=tf.nn.relu)
-        f3 = fc(f2, 256, scope='enc_fc3', activation_fn=tf.nn.relu)
+        f1 = fc(self.x, 500, scope='enc_fc1', activation_fn=tf.nn.relu)
+        f2 = fc(f1, 500, scope='enc_fc2', activation_fn=tf.nn.relu)
+        f3 = fc(f2, 2000, scope='enc_fc3', activation_fn=tf.nn.relu)
 
         self.z_mu = fc(f3, self.latent_size, scope='enc_fc4_mu', activation_fn=None)
         self.z_log_sigma_sq = fc(f3, self.latent_size, scope='enc_fc4_sigma', activation_fn=None)
@@ -61,6 +75,7 @@ class VariantionalAutoencoder(object):
                                mean=0, stddev=1, dtype=tf.float32)
 
         self.z = self.z_mu + tf.sqrt(tf.exp(self.z_log_sigma_sq)) * eps
+
 
         # Decode
         # z -> x_hat
@@ -92,7 +107,7 @@ class VariantionalAutoencoder(object):
         # shape = (batch, n_feat)
         p_c_z = tf.exp(tf.reduce_sum(tf.log(gmm_pi_3) - 0.5 * tf.log(2 * math.pi * gmm_sigma_3) - tf.square(z_3 - gmm_mu_3)/ (2 * gmm_sigma_3), 1)) + 1e-10
         # same shape because broadcasting
-        gamma = p_c_z / tf.reduce_sum(p_c_z, -1, keepdims=True)
+        gamma = p_c_z / tf.reduce_sum(p_c_z, -1, keepdims=True) + 1e-10
 
         gamma_3 = tf.tile(tf.expand_dims(gamma, 1), [1, self.latent_size, 1])
 
@@ -107,12 +122,29 @@ class VariantionalAutoencoder(object):
 
         gmm_loss = tf.reduce_mean(loss1 + loss2 + loss3 + loss4)
 
+        # avoid_zero_loss = tf.reduce_max(1 / self.gmm_sigma, 0)
+        #avoid_zero_loss = tf.reduce_max(1 / self.gmm_sigma)
+
         self.total_loss = recon_loss + gmm_loss
         self.debug_dict['recon_loss'] = recon_loss
         self.debug_dict['gmm_loss'] = gmm_loss
+        #self.debug_dict['avoid_zero_loss'] = avoid_zero_loss
+        #self.debug_dict['avoid_zero'] = avoid_zero_loss
+
+        self.nan_dict = {}
+        self.nan_dict['loss1'] = loss1
+        self.nan_dict['loss2'] = loss2
+        self.nan_dict['loss3'] = loss3
+        self.nan_dict['loss4'] = loss3
+        self.nan_dict['gamma'] = gamma
+        self.debug_dict['debug'] = self.nan_dict
         self.train_op = tf.train.AdamOptimizer(
             learning_rate=self.learning_rate).minimize(self.total_loss)
         return
+
+    def save(self, name):
+        saver = tf.train.Saver()
+        saver.save( self.sess, './' + name + ".ckpt")
 
     # Execute the forward and the backward pass
     def run_single_step(self, single_batch):
@@ -121,6 +153,13 @@ class VariantionalAutoencoder(object):
             feed_dict={self.x: single_batch}
         )
         return debug_dict
+
+    def update_learning_rate(self, alpha, under):
+        new_value = self.learning_rate * alpha
+        if new_value > under:
+            self.learning_rate = new_value
+        else:
+            self.learning_rate = under
 
     # x -> x_hat
     def reconstructor(self, x):
@@ -138,9 +177,9 @@ class VariantionalAutoencoder(object):
         return z
 
 
-def trainer(learning_rate=2e-3, batch_size=100, num_epoch=75, latent_size=10):
+def trainer(learning_rate=1e-4, batch_size=100, num_epoch=75, latent_size=10, gmm_n_feat=5, model_info_string=""):
     model = VariantionalAutoencoder(learning_rate=learning_rate,
-                                    batch_size=batch_size, latent_size=latent_size, gmm_n_feat=10)
+                                    batch_size=batch_size, latent_size=latent_size, gmm_n_feat=gmm_n_feat)
 
     # batches = np.split(train_values, 5)
     # for i in range(5):
@@ -149,7 +188,7 @@ def trainer(learning_rate=2e-3, batch_size=100, num_epoch=75, latent_size=10):
     #     for k, v in debug_dict.items():
     #         print(k)
     #         print(v)
-
+    time_string = strftime("%Y_%m_%d_%H_%M_%S", gmtime())
 
     for epoch in range(num_epoch):
         for iter in range(num_sample // batch_size):
@@ -158,95 +197,64 @@ def trainer(learning_rate=2e-3, batch_size=100, num_epoch=75, latent_size=10):
             # Execute the forward and the backward pass and report computed losses
             debug_dict = model.run_single_step(batch[0])
 
-        if epoch % 5 == 0:
-            print("======={}=======".format(epoch))
-            for k, v in debug_dict.items():
+        printdebug = True
+        nan_dict = None
+        print('===============================================================')
+        print("==============================={}===============================".format(epoch))
+        print('===============================================================')
+        nan_dict = debug_dict['debug']
+        for k, v in nan_dict.items():
+            print(k)
+            print(v)
+
+        for k, v in debug_dict.items():
+            if k != 'debug':
                 print(k)
                 print(v)
+
+        print("===============================End of {}===============================".format(epoch))
+
+
+        if epoch % 5 == 0:
+            model.save(str(epoch))
+
+            batches = np.empty((0, 784))
+            numbers = np.empty((0, 10))
+            z_s = np.empty((0, 2))
+
+            # Test the trained model: transformation
+            for i in range(30):
+                batch = mnist.test.next_batch(batch_size)
+                z = model.transformer(batch[0])
+                z_s = np.concatenate((z_s, z))
+                batches = np.concatenate((batches, batch[0]))
+                numbers = np.concatenate((numbers, batch[1]))
+
+            fig = plt.figure()
+            plt.scatter(z_s[:, 0], z_s[:, 1], c=np.argmax(numbers, 1))
+            plt.colorbar()
+            plt.grid()
+            plt.savefig('results/' + model_info_string + '_' + time_string + 'I_' + str(epoch) + '_transformed.png')
+            plt.close(fig)
+
+        if epoch % 10 and epoch > 0:
+            model.update_learning_rate(0.95, 0.00002)
 
     print('Done!')
     return model
 
 print("start training")
 # Train the model
-model = trainer(learning_rate=1e-4,  batch_size=15, num_epoch=100, latent_size=10)
+# model = trainer(learning_rate=1e-4,  batch_size=15, num_epoch=100, latent_size=10)
 
 print("ended training")
 
+batch_size = 100
+
+for i in range(5):
+    # Train the model with 2d latent space
+    model_info_string = "2D_10_rand_unif_2"
+    model_2d = trainer(learning_rate=2e-3,  batch_size=batch_size, num_epoch=50, latent_size=2, gmm_n_feat=10, model_info_string=model_info_string)
 
 
 
-
-
-
-
-
-
-
-
-# Test the trained model: reconstruction
-batch = mnist.test.next_batch(100)
-x_reconstructed = model.reconstructor(batch[0])
-
-n = np.sqrt(model.batch_size).astype(np.int32)
-I_reconstructed = np.empty((h*n, 2*w*n))
-for i in range(n):
-    for j in range(n):
-        x = np.concatenate(
-            (x_reconstructed[i*n+j, :].reshape(h, w),
-             batch[0][i*n+j, :].reshape(h, w)),
-            axis=1
-        )
-        I_reconstructed[i*h:(i+1)*h, j*2*w:(j+1)*2*w] = x
-
-fig = plt.figure()
-plt.imshow(I_reconstructed, cmap='gray')
-plt.savefig('I_reconstructed.png')
-plt.close(fig)
-
-# Test the trained model: generation
-# Sample noise vectors from N(0, 1)
-z = np.random.normal(size=[model.batch_size, model.latent_size])
-x_generated = model.generator(z)
-
-n = np.sqrt(model.batch_size).astype(np.int32)
-I_generated = np.empty((h*n, w*n))
-for i in range(n):
-    for j in range(n):
-        I_generated[i*h:(i+1)*h, j*w:(j+1)*w] = x_generated[i*n+j, :].reshape(28, 28)
-
-fig = plt.figure()
-plt.imshow(I_generated, cmap='gray')
-plt.savefig('I_generated.png')
-plt.close(fig)
-
-tf.reset_default_graph()
-# Train the model with 2d latent space
-model_2d = trainer(learning_rate=1e-4,  batch_size=100, num_epoch=50, latent_size=2)
-
-# Test the trained model: transformation
-batch = mnist.test.next_batch(3000)
-z = model_2d.transformer(batch[0])
-fig = plt.figure()
-plt.scatter(z[:, 0], z[:, 1], c=np.argmax(batch[1], 1))
-plt.colorbar()
-plt.grid()
-plt.savefig('I_transformed.png')
-plt.close(fig)
-
-# Test the trained model: transformation
-n = 20
-x = np.linspace(-2, 2, n)
-y = np.linspace(-2, 2, n)
-
-I_latent = np.empty((h*n, w*n))
-for i, yi in enumerate(x):
-    for j, xi in enumerate(y):
-        z = np.array([[xi, yi]]*model_2d.batch_size)
-        x_hat = model_2d.generator(z)
-        I_latent[(n-i-1)*28:(n-i)*28, j*28:(j+1)*28] = x_hat[0].reshape(28, 28)
-
-fig = plt.figure()
-plt.imshow(I_latent, cmap="gray")
-plt.savefig('I_latent.png')
-plt.close(fig)
